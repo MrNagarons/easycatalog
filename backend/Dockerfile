@@ -41,10 +41,12 @@ COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
 COPY backend/app /app/app
+COPY backend/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
 EXPOSE 8000
 
-# nodriver запускает Chromium с headless=False (см. backend/app/adapters/fallback_nodriver.py),
-# поэтому оборачиваем uvicorn в xvfb-run, чтобы был виртуальный X-дисплей.
-CMD ["xvfb-run", "-a", "--server-args=-screen 0 1440x2200x24", \
-     "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# entrypoint поднимает Xvfb (для headless=False в fallback_nodriver.py)
+# и exec'ит uvicorn как PID 1 — логи идут напрямую в docker logs.
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
