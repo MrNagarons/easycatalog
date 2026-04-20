@@ -12,6 +12,7 @@ RUN apt-get update \
         ca-certificates \
         chromium \
         xvfb \
+        xauth \
         dbus-x11 \
         fonts-liberation \
         libnss3 \
