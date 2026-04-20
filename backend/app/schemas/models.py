@@ -18,6 +18,7 @@ class ProductCard(BaseModel):
     product_url: str
     rating: str | None = None
     reviews_count: str | None = None
+    seller: str | None = None
 
 
 class ProductDetail(BaseModel):
