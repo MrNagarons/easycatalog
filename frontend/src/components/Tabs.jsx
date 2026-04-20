@@ -1,26 +1,43 @@
 const LABELS = {
-  kaspi: 'Kaspi Магазин',
+  kaspi: 'Kaspi',
   wildberries: 'Wildberries',
   ozon: 'Ozon',
 }
 
-export default function Tabs({ activeTab, onTabChange }) {
+export default function Tabs({ activeTab, onTabChange, totalCounts = {}, sourceMeta = {} }) {
   const tabs = ['kaspi', 'wildberries', 'ozon']
 
   return (
     <div className="tabs" role="tablist">
-      {tabs.map((tab) => (
-        <button
-          key={tab}
-          type="button"
-          role="tab"
-          aria-selected={activeTab === tab}
-          className={`tab-item ${activeTab === tab ? 'active' : ''}`}
-          onClick={() => onTabChange(tab)}
-        >
-          {LABELS[tab]}
-        </button>
-      ))}
+      {tabs.map((tab) => {
+        const count = totalCounts[tab] ?? 0
+        const sellersCount = sourceMeta[tab]?.sellersFound ?? sourceMeta[tab]?.sellers?.length ?? 0
+        const isActive = activeTab === tab
+
+        return (
+          <button
+            key={tab}
+            type="button"
+            role="tab"
+            id={`tab-${tab}`}
+            aria-selected={isActive}
+            className={`tab-item${isActive ? ' active' : ''}`}
+            onClick={() => onTabChange(tab)}
+          >
+            <span className="tab-label">{LABELS[tab]}</span>
+            {count > 0 && (
+              <span className="tab-badge tab-badge--items" title={`Найдено товаров: ${count}`}>
+                {count.toLocaleString('ru')}
+              </span>
+            )}
+            {sellersCount > 0 && (
+              <span className="tab-badge tab-badge--sellers" title={`Продавцов: ${sellersCount}`}>
+                {sellersCount} прод.
+              </span>
+            )}
+          </button>
+        )
+      })}
     </div>
   )
 }

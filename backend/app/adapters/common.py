@@ -18,13 +18,17 @@ RATING_CONTEXT_RE = re.compile(
     re.IGNORECASE,
 )
 RATING_WITH_SCALE_RE = re.compile(r"(?<!\d)([1-5](?:[\.,]\d{1,2})?)\s*(?:/\s*5|из\s*5|★)", re.IGNORECASE)
-RATING_BOUNDED_RE = re.compile(r"(?<!\d)([1-5](?:[\.,]\d{1,2})?)(?!\d)")
+RATING_BOUNDED_RE = re.compile(r"(?<![\d\.,])([1-5](?:[\.,]\d{1,2})?)(?![\d\.,])")
 REVIEWS_RE = re.compile(
-    r"(\d[\d\s\xa0]*)\s*(?:отзыв(?:а|ов)?|оцен(?:ка|ки|ок)|review(?:s)?)",
+    r"(?<![\.,\d])(\d+[\d\s\xa0]*)\s*(?:отзыв(?:а|ов)?|оцен(?:ка|ки|ок)?|review(?:s)?)",
     re.IGNORECASE,
 )
 REVIEWS_PREFIX_RE = re.compile(
-    r"(?:отзыв(?:ы|ов|а)?|review(?:s)?|оцен(?:ка|ки|ок)?)\s*[\(\[\s:]*\s*(\d[\d\s\xa0]*)",
+    r"(?:отзыв(?:ы|ов|а)?|review(?:s)?|оцен(?:ка|ки|ок)?)\s*[\(\[\s:]*\s*(?<![\.,\d])(\d+[\d\s\xa0]*)",
+    re.IGNORECASE,
+)
+SELLER_CONTEXT_RE = re.compile(
+    r"(?:продавец|магазин|seller|shop)\s*[:\-]?\s*([A-Za-zА-Яа-яЁё0-9][A-Za-zА-Яа-яЁё0-9\s\.\-\"']{1,80})",
     re.IGNORECASE,
 )
 AD_KEYWORDS = (
@@ -71,10 +75,40 @@ ANTIBOT_MARKERS = (
     "доступ ограничен",
     "нам нужно убедиться, что вы не робот",
     "please, enable javascript to continue",
+    "ой... кажется, такой страницы не существует",
     "captcha",
+    "antibot",
     "access denied",
     "forbidden",
     "robot",
+    "сопоставьте пазл",
+    "двигая ползунок",
+    "переместите ползунок",
+    "нажмите и перетащите",
+    "slide to verify",
+    "drag to verify",
+    "move the slider",
+)
+
+TOTAL_RESULTS_PATTERNS = (
+    re.compile(
+        r"все\s*категори(?:и|я)\s*\(\s*(\d[\d\s\xa0]{0,12})\s*\)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(?:найден[оы]?|нашл[оаи]?сь|всего|результат(?:ов|а)?)\s*[:\-]?\s*(\d[\d\s\xa0]{0,12})\s*(?:товар(?:ов|а)?|результат(?:ов|а)?|предложени(?:й|я))",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(\d[\d\s\xa0]{0,12})\s*(?:товар(?:ов|а)?|результат(?:ов|а)?|предложени(?:й|я))",
+        re.IGNORECASE,
+    ),
+    # Generic JSON keys: totalCount, total, found, totalResults, totalItems
+    re.compile(r'"(?:total|totalCount|totalResults|totalItems|found|itemsTotal|productsCount)"\s*:\s*(\d{1,12})', re.IGNORECASE),
+    # Ozon-specific: pagination total / catalogTotal
+    re.compile(r'"(?:catalogTotal|totalCount|paginationTotal|total)"\s*:\s*(\d{1,12})', re.IGNORECASE),
+    # Number followed by «товаров» without space (mobile rendering)
+    re.compile(r"(\d{2,12})товар", re.IGNORECASE),
 )
 
 
@@ -182,8 +216,8 @@ def format_rating(value: str | None) -> str | None:
     match = RATING_CONTEXT_RE.search(text)
     if not match:
         match = RATING_WITH_SCALE_RE.search(text)
-    if not match and ("★" in text or "рейтинг" in text.lower() or "rating" in text.lower()):
-        match = RATING_BOUNDED_RE.search(text)
+    if not match and ("★" in text or "рейтинг" in text.lower() or "rating" in text.lower() or "оцен" in text.lower() or "отзыв" in text.lower()):
+        match = RATING_BOUNDED_RE.search(text.replace("4K", "").replace("5G", ""))
     if not match:
         return None
 
@@ -213,11 +247,34 @@ def extract_reviews_count(value: str | None) -> str | None:
 
     lowered = text.lower()
     if any(token in lowered for token in ("отзыв", "оцен", "review")):
-        numeric = re.sub(r"\D", "", text)
-        if 1 <= len(numeric) <= 6:
-            return numeric
+        tokens = text.split()
+        for token in reversed(tokens):
+            numeric = re.sub(r"\D", "", token)
+            if 1 <= len(numeric) <= 6:
+                return numeric
 
     return None
+
+
+def extract_seller(value: str | None) -> str | None:
+    text = clean_text(value)
+    if not text:
+        return None
+
+    match = SELLER_CONTEXT_RE.search(text)
+    if not match:
+        return None
+
+    seller = clean_text(match.group(1))
+    seller = re.sub(r"[.,:;\-]+$", "", seller).strip()
+    if len(seller) < 2:
+        return None
+
+    blocked_tokens = {"и", "или", "в", "на", "по", "без", "новый", "sale", "promo"}
+    if seller.lower() in blocked_tokens:
+        return None
+
+    return seller
 
 
 def extract_rating_from_class_tokens(class_tokens: Iterable[str] | str | None) -> str | None:
@@ -278,6 +335,29 @@ def detect_antibot_challenge(html: str) -> str | None:
         if marker in text:
             return marker
     return None
+
+
+def extract_total_results_count(raw_html: str) -> int | None:
+    if not raw_html:
+        return None
+
+    text = clean_text(BeautifulSoup(raw_html, "html.parser").get_text(" ", strip=True))
+    combined = f"{text}\n{raw_html}"
+    candidates: list[int] = []
+
+    for pattern in TOTAL_RESULTS_PATTERNS:
+        for match in pattern.finditer(combined):
+            digits = re.sub(r"\D", "", match.group(1))
+            if not digits:
+                continue
+            value = int(digits)
+            if 0 <= value <= 50_000_000:
+                candidates.append(value)
+
+    if not candidates:
+        return None
+
+    return max(candidates)
 
 
 def first_attr(soup: BeautifulSoup, selectors: Iterable[str], attr: str) -> str | None:

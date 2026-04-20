@@ -15,6 +15,8 @@ from app.adapters.common import (
     extract_product_jsonld,
     extract_rating_from_class_tokens,
     extract_reviews_count,
+    extract_seller,
+    extract_total_results_count,
     first_attr,
     first_text,
     format_price,
@@ -25,7 +27,7 @@ from app.adapters.common import (
     looks_like_product_title,
     normalize_link,
 )
-from app.adapters.fallback_playwright import render_page
+from app.adapters.fallback_nodriver import render_page
 from app.core.config import settings
 from app.core.http_client import RequestClient
 from app.schemas.models import ProductCard, ProductDetail, SourceName
@@ -46,6 +48,8 @@ class KaspiAdapter(MarketplaceAdapter):
     def __init__(self, client: RequestClient):
         self.client = client
         self.last_block_reason: str | None = None
+        self.last_search_total_found: int | None = None
+        self.last_search_sellers: list[str] = []
 
     @staticmethod
     def _resolve_device_profile() -> str:
@@ -220,28 +224,42 @@ class KaspiAdapter(MarketplaceAdapter):
         url = f"{self.base_url}/shop/search/?text={quote_plus(query)}"
         profile = self._resolve_device_profile()
         user_agent = self.client.pick_user_agent(profile)
-
-        # Old parser relied on static HTML and broke on JS-rendered prices/ratings.
-        cards = await self._search_with_playwright(
-            url=url,
-            limit=limit,
-            device_profile=profile,
-            user_agent=user_agent,
-        )
-        if cards:
-            return cards[:limit]
-
-        logger.warning("Kaspi Playwright search returned no cards, trying HTTP fallback: %s", url)
+        self.last_search_total_found = None
+        self.last_search_sellers = []
+        
+        timeout_ms = int((settings.request_timeout_seconds + 12) * 1000)
+        proxy_url = self.client.proxy_manager.next_proxy()
+        
         try:
-            html = await self.client.fetch_text(
-                url,
-                source=self.source.value,
+            rendered = await render_page(
+                url=url,
+                timeout_ms=timeout_ms,
+                wait_selectors=self.search_wait_selectors,
+                proxy_url=proxy_url,
+                scroll=True,
                 device_profile=profile,
                 user_agent=user_agent,
             )
-            return self._parse_cards(html.text, limit)
+            cards = self._parse_cards(rendered, limit)
+
+            # If the rendered DOM does not expose global count, try raw HTML once.
+            if self.last_search_total_found is None:
+                try:
+                    html = await self.client.fetch_text(
+                        url,
+                        source=self.source.value,
+                        device_profile=profile,
+                        user_agent=user_agent,
+                    )
+                    parsed_total = extract_total_results_count(html.text)
+                    if parsed_total is not None:
+                        self.last_search_total_found = parsed_total
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("Kaspi total count fallback fetch failed: %s", exc)
+
+            return cards
         except Exception as exc:  # noqa: BLE001
-            logger.warning("Kaspi HTTP fallback failed: %s", exc)
+            logger.warning("Kaspi HTTP request failed: %s", exc)
             if self.last_block_reason:
                 raise RuntimeError(f"Kaspi blocked by anti-bot challenge: {self.last_block_reason}") from exc
             raise RuntimeError("Kaspi parser returned no products") from exc
@@ -250,126 +268,26 @@ class KaspiAdapter(MarketplaceAdapter):
         full_url = urljoin(self.base_url, product_url)
         profile = self._resolve_device_profile()
         user_agent = self.client.pick_user_agent(profile)
-        detail = await self._detail_with_playwright(
-            full_url,
-            device_profile=profile,
-            user_agent=user_agent,
-        )
-        if detail and detail.title:
-            return detail
+        
+        timeout_ms = int((settings.request_timeout_seconds + 12) * 1000)
+        proxy_url = self.client.proxy_manager.next_proxy()
 
-        logger.warning("Kaspi Playwright detail parse incomplete, trying HTTP fallback: %s", full_url)
-        html = await self.client.fetch_text(
-            full_url,
-            source=self.source.value,
-            device_profile=profile,
-            user_agent=user_agent,
-        )
-        fallback_detail = self._parse_detail(html.text, full_url)
-        if fallback_detail and fallback_detail.title:
-            return fallback_detail
+        try:
+            rendered = await render_page(
+                url=full_url,
+                timeout_ms=timeout_ms,
+                wait_selectors=self.detail_wait_selectors,
+                proxy_url=proxy_url,
+                scroll=True,
+                device_profile=profile,
+                user_agent=user_agent,
+            )
+            detail = self._parse_detail(rendered, full_url)
+            if detail and detail.title:
+                return detail
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Kaspi HTTP request failed: %s", exc)
         raise RuntimeError("Failed to parse Kaspi product details")
-
-    async def _search_with_playwright(
-        self,
-        url: str,
-        limit: int,
-        device_profile: str,
-        user_agent: str,
-    ) -> list[ProductCard]:
-        timeout_ms = int((settings.request_timeout_seconds + 8) * 1000)
-        for attempt in range(1, settings.max_retries + 1):
-            proxy_url = self.client.proxy_manager.next_proxy()
-            try:
-                rendered = await render_page(
-                    url=url,
-                    timeout_ms=timeout_ms,
-                    wait_selectors=self.search_wait_selectors,
-                    proxy_url=proxy_url,
-                    scroll=True,
-                    device_profile=device_profile,
-                    user_agent=user_agent,
-                )
-
-                blocked_by = detect_antibot_challenge(rendered)
-                if blocked_by:
-                    self.last_block_reason = blocked_by
-                    self.client.proxy_manager.mark_dead(
-                        proxy_url,
-                        reason=f"anti-bot challenge: {blocked_by}",
-                        url=url,
-                    )
-                    if settings.enable_block_telemetry:
-                        log_block_event(
-                            logger,
-                            source=self.source.value,
-                            stage="playwright_search",
-                            url=url,
-                            marker=blocked_by,
-                            attempt=attempt,
-                            proxy=proxy_url,
-                        )
-                    else:
-                        logger.warning(
-                            "Kaspi anti-bot challenge detected, attempt=%s proxy=%s marker=%s",
-                            attempt,
-                            proxy_url,
-                            blocked_by,
-                        )
-                    await asyncio.sleep(settings.retry_backoff_seconds * attempt)
-                    continue
-
-                cards = self._parse_cards(rendered, limit)
-                self.client.proxy_manager.mark_success(proxy_url)
-                if cards:
-                    self.last_block_reason = None
-                    return cards
-                logger.warning("Kaspi parse produced 0 cards, attempt=%s url=%s", attempt, url)
-            except Exception as exc:  # noqa: BLE001
-                self.client.proxy_manager.mark_dead(proxy_url, reason=f"playwright search failed: {exc}", url=url)
-                logger.warning("Kaspi Playwright search failed, attempt=%s proxy=%s err=%s", attempt, proxy_url, exc)
-
-            await asyncio.sleep(settings.retry_backoff_seconds * attempt)
-
-        if self.last_block_reason:
-            raise RuntimeError(f"Kaspi blocked by anti-bot challenge: {self.last_block_reason}")
-        return []
-
-    async def _detail_with_playwright(
-        self,
-        full_url: str,
-        device_profile: str,
-        user_agent: str,
-    ) -> ProductDetail | None:
-        timeout_ms = int((settings.request_timeout_seconds + 10) * 1000)
-        for attempt in range(1, settings.max_retries + 1):
-            proxy_url = self.client.proxy_manager.next_proxy()
-            try:
-                rendered = await render_page(
-                    url=full_url,
-                    timeout_ms=timeout_ms,
-                    wait_selectors=self.detail_wait_selectors,
-                    proxy_url=proxy_url,
-                    scroll=True,
-                    device_profile=device_profile,
-                    user_agent=user_agent,
-                )
-                detail = self._parse_detail(rendered, full_url)
-                self.client.proxy_manager.mark_success(proxy_url)
-                if detail.title:
-                    return detail
-                logger.warning("Kaspi detail parsed without title, attempt=%s url=%s", attempt, full_url)
-            except Exception as exc:  # noqa: BLE001
-                self.client.proxy_manager.mark_dead(
-                    proxy_url,
-                    reason=f"playwright detail failed: {exc}",
-                    url=full_url,
-                )
-                logger.warning("Kaspi Playwright detail failed, attempt=%s proxy=%s err=%s", attempt, proxy_url, exc)
-
-            await asyncio.sleep(settings.retry_backoff_seconds * attempt)
-
-        return None
 
     def _parse_cards(self, html: str, limit: int) -> list[ProductCard]:
         soup = BeautifulSoup(html, "html.parser")
@@ -394,6 +312,7 @@ class KaspiAdapter(MarketplaceAdapter):
                 {
                     "title": None,
                     "price": None,
+                    "seller": None,
                     "rating": None,
                     "reviews_count": None,
                     "image_url": None,
@@ -422,6 +341,15 @@ class KaspiAdapter(MarketplaceAdapter):
 
             if not entry["price"]:
                 entry["price"] = self._extract_price(container, blob_text)
+            if not entry["seller"]:
+                seller_candidate = choose_first_non_empty(
+                    [
+                        first_text(container, ["[class*='seller']", "[data-testid*='seller']"]),
+                        extract_seller(blob_text),
+                    ]
+                )
+                if seller_candidate:
+                    entry["seller"] = seller_candidate
             if not entry["rating"]:
                 entry["rating"] = self._extract_rating(container, blob_text)
             if not entry["reviews_count"]:
@@ -448,6 +376,7 @@ class KaspiAdapter(MarketplaceAdapter):
                 continue
 
             price = entry["price"] if isinstance(entry["price"], str) else None
+            seller = entry["seller"] if isinstance(entry["seller"], str) else None
             if not price:
                 for blob in blob_texts:
                     parsed_price = format_price(blob)
@@ -468,6 +397,7 @@ class KaspiAdapter(MarketplaceAdapter):
                     title=title,
                     image_url=image_url,
                     price=price,
+                    seller=seller,
                     product_url=product_url,
                     rating=rating,
                     reviews_count=reviews_count,
@@ -482,6 +412,15 @@ class KaspiAdapter(MarketplaceAdapter):
             skipped_ads,
             skipped_title,
             skipped_missing_price,
+        )
+        self.last_search_total_found = extract_total_results_count(html)
+        self.last_search_sellers = sorted(
+            {
+                item.seller.strip()
+                for item in items
+                if isinstance(item.seller, str) and item.seller.strip()
+            },
+            key=str.lower,
         )
         if not items:
             logger.warning("Kaspi parser found no relevant product cards")

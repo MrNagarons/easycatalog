@@ -110,12 +110,11 @@ class RequestClient:
         device_profile: str,
         user_agent: str | None,
     ):
-        # Keep headers empty so tls_requests can auto-inject browser-matching UA/sec-ch-ua.
         timeout_seconds = max(1.0, float(settings.request_timeout_seconds))
-        _ = user_agent
         return await asyncio.to_thread(
             tls_requests.get,
             url,
+            headers=self._headers(device_profile, user_agent=user_agent),
             proxy=proxy_url,
             timeout=timeout_seconds,
             follow_redirects=True,
@@ -192,7 +191,6 @@ class RequestClient:
                     device_profile=normalized_profile,
                     user_agent=user_agent,
                 )
-
                 if response.status_code <= 0:
                     reason = (response.text or "TLS transport error").strip()
                     self.proxy_manager.mark_dead(proxy_url, reason=reason, url=url)
@@ -224,14 +222,19 @@ class RequestClient:
                     await asyncio.sleep(sleep_s)
                     continue
                 elif response.status_code >= 400:
-                    last_error = RuntimeError(f"HTTP {response.status_code}")
-                else:
-                    self.proxy_manager.mark_success(proxy_url)
-                    return FetchResult(
-                        text=response.text,
-                        status_code=response.status_code,
-                        final_url=str(response.url or url),
-                    )
+                    reason = f"HTTP {response.status_code}"
+                    self.proxy_manager.mark_dead(proxy_url, reason=reason, url=url)
+                    last_error = RuntimeError(reason)
+                    sleep_s = self._compute_backoff(attempt, blocked=False)
+                    await asyncio.sleep(sleep_s)
+                    continue
+
+                self.proxy_manager.mark_success(proxy_url)
+                return FetchResult(
+                    text=response.text,
+                    status_code=response.status_code,
+                    final_url=str(getattr(response, "url", url)),
+                )
             except (ProxyError, TLSError) as exc:
                 self.proxy_manager.mark_dead(proxy_url, reason=str(exc), url=url)
                 last_error = exc
@@ -239,6 +242,9 @@ class RequestClient:
             except (HTTPError, OSError) as exc:
                 last_error = exc
                 logger.warning("TLS request failure for %s: %s", url, exc)
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                logger.warning("Unexpected HTTP client failure for %s via proxy=%s: %s", url, proxy_url, exc)
 
             sleep_s = self._compute_backoff(attempt, blocked=False)
             await asyncio.sleep(sleep_s)

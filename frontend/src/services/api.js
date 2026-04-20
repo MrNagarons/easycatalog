@@ -1,7 +1,10 @@
 const API_BASE = import.meta.env.VITE_API_BASE_URL || '/api'
+import { searchKaspiDirect } from './directSearch'
+
 const DETAILS_CACHE_KEY = 'smart-catalog:details-cache:v2'
 const DETAILS_CACHE_TTL_MS = 30 * 60 * 1000
 const DETAILS_CACHE_LIMIT = 120
+const ENABLE_CLIENT_SEARCH = String(import.meta.env.VITE_ENABLE_CLIENT_SEARCH || 'true').toLowerCase() !== 'false'
 
 const safeParse = (rawValue) => {
   try {
@@ -97,8 +100,54 @@ async function request(path, options = {}) {
 }
 
 export const api = {
-  search(query) {
-    return request(`/search?query=${encodeURIComponent(query)}`)
+  async search(query, options = {}) {
+    const useClientFirst = options.useClientFirst ?? ENABLE_CLIENT_SEARCH
+    let clientKaspi = null
+    let clientKaspiError = null
+
+    if (useClientFirst) {
+      try {
+        clientKaspi = await searchKaspiDirect(query)
+      } catch (error) {
+        clientKaspiError = error instanceof Error ? error.message : String(error)
+      }
+    }
+
+    const backendPayload = await request(`/search?query=${encodeURIComponent(query)}`)
+    const normalizedResults = Array.isArray(backendPayload?.results)
+      ? backendPayload.results.map((entry) => ({ ...entry, source_mode: 'server' }))
+      : []
+
+    if (clientKaspi && Array.isArray(clientKaspi.items) && clientKaspi.items.length > 0) {
+      const kaspiIndex = normalizedResults.findIndex((entry) => entry?.source === 'kaspi')
+      if (kaspiIndex >= 0) {
+        normalizedResults[kaspiIndex] = {
+          ...normalizedResults[kaspiIndex],
+          items: clientKaspi.items,
+          meta: clientKaspi.meta,
+          error: null,
+          source_mode: 'client',
+          client_error: null,
+        }
+      } else {
+        normalizedResults.unshift(clientKaspi)
+      }
+    } else if (clientKaspiError) {
+      const kaspiIndex = normalizedResults.findIndex((entry) => entry?.source === 'kaspi')
+      if (kaspiIndex >= 0) {
+        normalizedResults[kaspiIndex] = {
+          ...normalizedResults[kaspiIndex],
+          source_mode: 'server',
+          client_error: clientKaspiError,
+        }
+      }
+    }
+
+    return {
+      ...backendPayload,
+      results: normalizedResults,
+      search_mode: clientKaspi ? 'client_first' : 'server_fallback',
+    }
   },
   getCachedProductDetails(source, productUrl) {
     return getCachedDetails(source, productUrl)

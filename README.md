@@ -40,6 +40,10 @@ Kaspi, Wildberries и Ozon активно используют динамиче�
 - `SOURCE_CONCURRENCY_LIMIT` - ограничение параллельных запросов на один источник.
 - `SOURCE_MIN_INTERVAL_SECONDS` - минимальный интервал между запросами к одному источнику.
 - `ENABLE_BLOCK_TELEMETRY` - включение структурированных событий блокировок в логах.
+- `APIFY_API_KEY` - ваш личный ключ Apify для обогащения карточек Ozon/WB.
+- `APIFY_TOKEN` - альтернативное имя переменной (если уже используете такое в окружении).
+- `APIFY_OZON_ACTOR_ID` - actor для Ozon (по умолчанию `zen-studio/ozon-scraper-pro`).
+- `APIFY_WILDBERRIES_ACTOR_ID` - actor для WB (по умолчанию `akoinc/wb-card-parser`).
 
 ## Структура
 
@@ -52,6 +56,21 @@ Kaspi, Wildberries и Ozon активно используют динамиче�
 
 ## Запуск
 
+### Через Docker Compose (рекомендуется)
+
+```bash
+cp .env.example backend/.env
+# при необходимости добавьте APIFY_API_KEY и другие переменные в backend/.env
+docker compose up -d --build
+```
+
+- Frontend: http://localhost:5173 (nginx раздаёт production build и проксирует `/api` на backend).
+- Backend API: http://localhost:8000 (например, `curl http://localhost:8000/api/health`).
+
+Остановить: `docker compose down`.
+
+### Вручную
+
 ### 1. Backend
 
 ```bash
@@ -63,6 +82,14 @@ playwright install chromium
 cp .env.example .env
 uvicorn app.main:app --reload --port 8000
 ```
+
+Перед запуском добавьте API-ключ в `backend/.env`:
+
+```env
+APIFY_API_KEY=apify_api_xxxxxxxxxxxxxxxxxxxxxxxxx
+```
+
+Если ключ не указан, приложение продолжит работать, но Ozon/WB будут получать детали только через fallback-парсинг.
 
 ### 2. Frontend
 
@@ -85,9 +112,3 @@ Frontend поднимется на `http://localhost:5173`, backend на `http:/
 - `GET /api/proxies/status`
 - `GET /api/proxies/errors`
 
-## Что улучшить дальше
-
-- Точечно обновить селекторы под актуальную верстку сайтов
-- Добавить кэширование запросов
-- Добавить ограничение частоты запросов по IP
-- Добавить e2e тесты на Playwright
