@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from urllib.parse import quote_plus, urljoin
+from urllib.parse import quote, quote_plus, urljoin, urlparse
 
 from bs4 import BeautifulSoup
 
@@ -32,6 +32,34 @@ from app.core.http_client import RequestClient
 from app.schemas.models import ProductCard, ProductDetail, SourceName
 
 logger = logging.getLogger(__name__)
+
+
+_OZON_CDN_HOST_SUFFIXES = ("ozone.ru", "ozon.ru")
+
+
+def _proxy_ozon_image(raw: object) -> str | None:
+    """Rewrite Ozon-hosted image URLs to go through /api/image-proxy.
+
+    The Ozon CDN returns 403 when a browser loads images directly (Referer/
+    hotlink protection), so we re-serve them through the backend. Non-Ozon
+    URLs and falsy values are passed through unchanged.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, dict):
+        raw = raw.get("url") or raw.get("src") or raw.get("link") or ""
+    url = str(raw).strip()
+    if not url:
+        return None
+    try:
+        host = (urlparse(url).netloc or "").lower()
+    except Exception:  # noqa: BLE001
+        return url
+    if not host:
+        return url
+    if any(host == s or host.endswith("." + s) for s in _OZON_CDN_HOST_SUFFIXES):
+        return f"/api/image-proxy?url={quote(url, safe='')}"
+    return url
 
 
 class OzonAdapter(MarketplaceAdapter):
@@ -93,6 +121,7 @@ class OzonAdapter(MarketplaceAdapter):
                         price_raw = str(price_raw).replace("\u2009", "").replace(" ", "").strip() + " ₽"
 
                     image_url = item.get("images", [None])[0] if item.get("images") else item.get("image")
+                    image_url = _proxy_ozon_image(image_url)
                     product_url = item.get("url") or item.get("productUrl") or ""
                     raw_seller = item.get("seller")
                     if isinstance(raw_seller, dict):
@@ -195,6 +224,7 @@ class OzonAdapter(MarketplaceAdapter):
                     image_url = item.get("images", [None])[0] if item.get("images") else ""
                     if not image_url and item.get("descriptionImages"):
                         image_url = item.get("descriptionImages")[0]
+                    image_url = _proxy_ozon_image(image_url) or ""
 
                     description = item.get("richDescription") or item.get("description") or ""
                     brand = item.get("brand") or ""
@@ -426,6 +456,7 @@ class OzonAdapter(MarketplaceAdapter):
             rating = self._extract_rating(container, blob_text)
             reviews_count = self._extract_reviews(container, blob_text)
             image_url = self._extract_image(container or link)
+            image_url = _proxy_ozon_image(image_url)
             seller = choose_first_non_empty(
                 [
                     first_text(
@@ -541,6 +572,7 @@ class OzonAdapter(MarketplaceAdapter):
             ]
         )
         image_url = normalize_link(self.base_url, image_url) if image_url else None
+        image_url = _proxy_ozon_image(image_url)
 
         price_raw = choose_first_non_empty(
             [
