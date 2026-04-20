@@ -94,7 +94,13 @@ class OzonAdapter(MarketplaceAdapter):
 
                     image_url = item.get("images", [None])[0] if item.get("images") else item.get("image")
                     product_url = item.get("url") or item.get("productUrl") or ""
-                    seller = item.get("seller") or item.get("brand") or "Ozon"
+                    raw_seller = item.get("seller")
+                    if isinstance(raw_seller, dict):
+                        raw_seller = raw_seller.get("name") or raw_seller.get("title")
+                    raw_brand = item.get("brand")
+                    if isinstance(raw_brand, dict):
+                        raw_brand = raw_brand.get("name") or raw_brand.get("title")
+                    seller = raw_seller or raw_brand or "Ozon"
                     rating = str(item.get("rating") or "")
                     reviews_count = str(item.get("reviewCount") or item.get("reviewsCount") or "")
                     
